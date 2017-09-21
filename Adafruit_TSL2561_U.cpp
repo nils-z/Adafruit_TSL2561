@@ -40,10 +40,6 @@
 
 #include "Adafruit_TSL2561_U.h"
 
-#define TSL2561_DELAY_INTTIME_13MS    (15)
-#define TSL2561_DELAY_INTTIME_101MS   (120)
-#define TSL2561_DELAY_INTTIME_402MS   (450)
-
 /*========================================================================*/
 /*                          PRIVATE FUNCTIONS                             */
 /*========================================================================*/
@@ -496,6 +492,172 @@ uint32_t Adafruit_TSL2561_Unified::calculateLux(uint16_t broadband, uint16_t ir)
 
 /**************************************************************************/
 /*!
+    Converts a standard SI lux value to a raw sensor value (for channel 0),
+    taking into account the configured gain for the sensor. Required for
+    SI lux consistency, and needed for interrupt threshold configuration.
+
+    Important:
+     * first configure the integration time and gain.
+     * in case of autogain, the gain factor can be adjusted depending on the
+       measurement; you might want to perform a measurement first to autoconfigure
+       it, or avoid autogain alltogether with interrupts.
+     * changing the integration value requires changing the interrupt thresholds!
+
+    -----------------------------------------------------------------------
+
+    TIJA: So, funny story: the raw values (ch0/ch1) to lux conversion takes
+    both values into account. For interrupts, we can only configure a
+    threshold for channel 0. So the problem is: given a lux value, can
+    we make an educated guess for what the channel 0 value would be, leaving
+    channel 1 as an undetermined parameter?
+
+    If you look at the datasheet p23, you'll see the ratio of both is
+    determining what formula to use.
+    (https://cdn-shop.adafruit.com/datasheets/TSL2561.pdf)
+
+    Here, we take the naieve assumption that the expected ratio is that as
+    covered by the sensitivity curves of Figure 4, p8. The ratio of the
+    area under both curves is roughly:
+      * area under curve channel0: 24 squares
+      * area under curve channel1: 7.5 squares
+      * ratio of areas under curve: 7.5 / 24 = 0.3125
+
+    So the most unbiased estimation for the ration is somewhere around 0.31 - 0.32.
+    For conditions under sunlight, this was experimentally verified and more or
+    less holds. Under artificial light (e.g. LED light), the IR component is
+    (not very surprisingly) much smaller and leans more towards ratio 0.11 !!!
+    Very roughly speaking the (black body) light spectrum of the sun is, again
+    very roughly speaking, ""uniform"" (*cough* cutting corners *cough*) across
+    the sensitivity range of the sensor (300-1100nm wavelength).
+
+    It is possible to supply different estimations for the ratio, depending
+    on your specific lighting conditions where you need thresholds (because that
+    would be the only situation where I would recommend using this function).
+
+      TSL2561_APPROXCHRATIO_SUN = 0.325
+      TSL2561_APPROXCHRATIO_LED = 0.100
+
+    The formula's, I refer to p23 of the datasheet to see where they come from
+    (which seems to be an empiric formula from TAOS).
+
+    Note: below is a mixture of fixed point & floating point math; sorry, did
+    not have the time to rewrite everything in fixed point math.
+
+*/
+/**************************************************************************/
+uint32_t Adafruit_TSL2561_Unified::calculateRawCH0(uint16_t lux, float approxChRatio)
+{
+  unsigned long luxScale;
+  unsigned long ch0Scale = 0;
+  unsigned long chScale;
+
+  /* First, go to fixed point math scale -- reference scale is 2^TSL2561_LUX_CHSCALE = 2^10 */
+  luxScale = (lux << TSL2561_LUX_CHSCALE);
+
+  /* Next, calculate from lux to (scaled) channel0 values */
+#ifdef TSL2561_PACKAGE_CS
+  // CS Package
+  // ----------------------
+  // For calculating CH1/CH0 to Lux (p23 datasheet):
+  //    For 0 < CH1/CH0 < 0.52      Lux = 0.0315 * CH0 - 0.0593 * CH0 * ((CH1/CH0)^1.4)
+  //    For 0.52 < CH1/CH0 < 0.65   Lux = 0.0229 * CH0 - 0.0291 * CH1
+  //    For 0.65 < CH1/CH0 < 0.80   Lux = 0.0157 * CH0 - 0.0180 * CH1
+  //    For 0.80 < CH1/CH0 < 1.30   Lux = 0.00338 * CH0 - 0.00260 * CH1
+  //    For CH1/CH0 > 1.30          Lux = 0
+  //
+  // Replacing CH1 = (CH1/CH0) * CH0 = approxChRatio * CH0, we can solve all
+  // of these for CH0:
+  //
+  //    For 0 < CH1/CH0 < 0.52      Lux = (0.0315 - 0.0593 * ((approxChRatio)^1.4) )* CH0
+  //    For 0.52 < CH1/CH0 < 0.65   Lux = (0.0229 - 0.0291 * approxChRatio) * CH0
+  //    For 0.65 < CH1/CH0 < 0.80   Lux = (0.0157 - 0.0180 * approxChRatio) * CH0
+  //    For 0.80 < CH1/CH0 < 1.30   Lux = (0.00338 - 0.00260 * approxChRatio) * CH0
+  //    For CH1/CH0 > 1.30          Lux = 0
+  //
+
+  float divisor = 1;
+  if(approxChRatio > 1.30) {
+    return 0xFFFF;
+  } else if(approxChRatio > 0.80) {
+    divisor = (0.00338 - 0.00260 * approxChRatio);
+  } else if(approxChRatio > 0.65) {
+    divisor = (0.0157 - 0.0180 * approxChRatio);
+  } else if(approxChRatio > 0.52) {
+    divisor = (0.0229 - 0.0291 * approxChRatio);
+  } else {
+    // 0 < chRatio < 0.50
+    divisor = (0.0315 - 0.0593 * pow(approxChRatio, 1.4));
+  }
+#else
+  // T, FN, and CL Package
+  // ----------------------
+  // For calculating CH1/CH0 to Lux (p23 datasheet):
+  //    For 0 < CH1/CH0 < 0.50     Lux = 0.0304 * CH0 - 0.062 * CH0 * ((CH1/CH0)^1.4)
+  //    For 0.50 < CH1/CH0 < 0.61  Lux = 0.0224 * CH0 - 0.031 * CH1
+  //    For 0.61 < CH1/CH0 < 0.80  Lux = 0.0128  * CH0 - 0.0153 * CH1
+  //    For 0.80 < CH1/CH0 < 1.30  Lux = 0.00146 * CH0 - 0.00112 * CH1
+  //    For CH1/CH0 > 1.30         Lux = 0
+  //
+  // Replacing CH1 = (CH1/CH0) * CH0 = approxChRatio * CH0, we can solve all
+  // of these for CH0:
+  //
+  //    For 0 < CH1/CH0 < 0.50     Lux = ( 0.0304 - 0.062 * ((approxChRatio)^1.4)) * CH0
+  //    For 0.50 < CH1/CH0 < 0.61  Lux = (0.0224 - 0.031 * approxChRatio) * CH0
+  //    For 0.61 < CH1/CH0 < 0.80  Lux = (0.0128 - 0.0153 * approxChRatio) * CH0
+  //    For 0.80 < CH1/CH0 < 1.30  Lux = (0.00146 - 0.00112 * approxChRatio) * CH0
+  //    For CH1/CH0 > 1.30         Lux = 0 --> we return the highest possible value 0xFFFF
+  //
+
+  float divisor = 1;
+  if(approxChRatio > 1.30) {
+    // Easy one :)
+    return 0xFFFF;
+  } else if(approxChRatio > 0.80) {
+    divisor = (0.00146 - 0.00112 * approxChRatio);
+  } else if(approxChRatio > 0.61) {
+    divisor = (0.0128 - 0.0153 * approxChRatio);
+  } else if(approxChRatio > 0.50) {
+    divisor = (0.0224 - 0.031 * approxChRatio);
+  } else {
+    // 0 < chRatio < 0.50
+    divisor = (0.0304 - 0.062 * pow(approxChRatio, 1.4));
+  }
+
+  // Calculate CH0 value (fixed point scaled)
+  if (divisor > 0) {
+    ch0Scale = (unsigned long)(luxScale / divisor);
+  } else {
+    return 0xFFFF;
+  }
+#endif
+
+  /* Now, we need to scale back down... the correct scale depends on the
+     integration time and the gain */
+
+  switch (_tsl2561IntegrationTime)
+  {
+    case TSL2561_INTEGRATIONTIME_13MS:
+      chScale = TSL2561_LUX_CHSCALE_TINT0;
+      break;
+    case TSL2561_INTEGRATIONTIME_101MS:
+      chScale = TSL2561_LUX_CHSCALE_TINT1;
+      break;
+    default: /* No scaling ... integration time = 402ms */
+      chScale = (1 << TSL2561_LUX_CHSCALE);
+      break;
+  }
+
+  /* Scale for gain (1x or 16x) */
+  if (!_tsl2561Gain) {
+    chScale = chScale << 4;
+  }
+
+  /* Scale the channel value back */
+  return (ch0Scale / chScale);
+}
+
+/**************************************************************************/
+/*!
     @brief  Gets the most recent sensor event
     @param  event Pointer to a sensor_event_t type that will be filled 
                   with the lux value, timestamp, data type and sensor ID.
@@ -631,19 +793,15 @@ void Adafruit_TSL2561_Unified::setInterruptControl(tsl2561InterruptControl_t int
   if(_allowSleep) disable();
 }
 
-
-
-
-
-//
-// low, high: 16-bit threshold values
-// Returns true (1) if successful, false (0) if there was an I2C error
-// (Also see getError() below)
-
 /**************************************************************************/
 /*!
     @brief  Set interrupt thresholds (TSL2561 supports only interrupts
-    generated by thresholds on channel 0)
+    generated by thresholds on channel 0).
+
+    Important: values supplied as thresholds are raw sensor values, and
+    NOT values in the SI lux unit. In order to get an estimation of the
+    raw value to pass here when you want a lux value as a threshold, use
+    the calculateRawCH0() function with the right approximation parameter.
 */
 /**************************************************************************/
 
